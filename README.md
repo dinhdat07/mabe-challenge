@@ -1,4 +1,4 @@
-# MABe Mouse Behavior Detection
+﻿# MABe Mouse Behavior Detection
 
 Notebooks have been refactored into Python modules under `src/mabe` plus bash helpers in `../scripts`.
 
@@ -9,6 +9,13 @@ Notebooks have been refactored into Python modules under `src/mabe` plus bash he
 - `inference/`: inference for XGB/CNN/TCN/ensemble and a runner to assemble submissions per section/mode.
 - `notebooks/`: original notebooks (EDA + models).
 - `../scripts/`: bash scripts to train + infer each model.
+
+## Notebooks
+- `notebooks/eda.ipynb`: exploratory data analysis on tracks/annotations.
+- `notebooks/mabe-mice-xgboost.ipynb`: XGBoost baseline with feature engineering and per-action binary training.
+- `notebooks/mabe-mice-1d-cnn.ipynb`: ResNet-1D windowed classifier on engineered features (single/pair modes).
+- `notebooks/mabe-mice-tcn.ipynb`: causal TCN variant on the same features.
+- `notebooks/mabe-mice-ensemble.ipynb`: blends multiple model outputs and tunes thresholds/weights.
 
 ## Requirements
 - Python 3.10+, PyTorch, scikit-learn, optuna, joblib, pandas, numpy, koolbox, xgboost.
