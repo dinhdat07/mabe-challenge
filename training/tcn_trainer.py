@@ -1,10 +1,11 @@
-"""Training loop for the 1D CNN (ResNet) model."""
+"""Training loop for causal Temporal Convolutional Network (TCN) baseline."""
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 import json
 import gc
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -15,28 +16,11 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedGroupKFold
 
-
-class FocalBCEWithLogitsLoss(nn.Module):
-    def __init__(self, pos_weight=None, gamma: float = 2.0, reduction: str = "mean"):
-        super().__init__()
-        self.pos_weight = pos_weight
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, logits, targets):
-        bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, pos_weight=self.pos_weight, reduction="none")
-        probas = torch.sigmoid(logits)
-        pt = torch.where(targets == 1, probas, 1 - probas)
-        loss = (1 - pt) ** self.gamma * bce
-        if self.reduction == "mean":
-            return loss.mean()
-        if self.reduction == "sum":
-            return loss.sum()
-        return loss
+from mabe.training.cnn_trainer import FocalBCEWithLogitsLoss, tune_thresholds_per_class, save_feature_columns
 
 
 class MABeLazyDataset(Dataset):
-    """Sliding window dataset over precomputed features."""
+    """Sliding window dataset; center frame label for each window."""
 
     def __init__(self, feat_list, scaler: StandardScaler, label_list=None, window_size: int = 30):
         self.feat_list = feat_list
@@ -57,89 +41,74 @@ class MABeLazyDataset(Dataset):
         window = self.feat_list[v_idx][t : t + self.window_size]
         if self.scaler is not None:
             window = self.scaler.transform(window)
-        X = torch.tensor(window, dtype=torch.float32).transpose(0, 1)
+        x = torch.tensor(window, dtype=torch.float32).transpose(0, 1)  # (feat, seq)
         if self.label_list is None:
-            return X
+            return x
         center_frame = t + self.window_size // 2
         y = torch.tensor(self.label_list[v_idx][center_frame], dtype=torch.float32)
-        return X, y
+        return x, y
 
 
-class ResidualBlock1D(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, dilation: int = 1, dropout: float = 0.2):
+class Chomp1d(nn.Module):
+    def __init__(self, chomp: int):
         super().__init__()
-        padding = (kernel_size - 1) * dilation // 2
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding, dilation=dilation)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=padding, dilation=dilation)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-        self.shortcut = nn.Conv1d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+        self.chomp = chomp
 
     def forward(self, x):
-        residual = self.shortcut(x)
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.dropout(x)
-        x = self.bn2(self.conv2(x))
-        x += residual
-        return self.relu(x)
+        return x[..., :-self.chomp] if self.chomp > 0 else x
 
 
-class MouseResNet1D(nn.Module):
-    def __init__(self, n_feat: int, n_class: int, base_filters: int = 64):
+class TemporalBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, k: int = 3, d: int = 1, dropout: float = 0.1):
         super().__init__()
-        self.stem = nn.Sequential(nn.Conv1d(n_feat, base_filters, kernel_size=7, padding=3), nn.BatchNorm1d(base_filters), nn.ReLU())
-        self.layer1 = ResidualBlock1D(base_filters, base_filters, dilation=1)
-        self.layer2 = ResidualBlock1D(base_filters, base_filters * 2, dilation=2)
-        self.layer3 = ResidualBlock1D(base_filters * 2, base_filters * 4, dilation=4)
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(base_filters * 4, n_class)
+        pad = (k - 1) * d
+        self.net = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, k, padding=pad, dilation=d),
+            Chomp1d(pad),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(out_ch, out_ch, k, padding=pad, dilation=d),
+            Chomp1d(pad),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.down = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
     def forward(self, x):
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.global_pool(x).squeeze(-1)
+        return nn.functional.relu(self.net(x) + self.down(x))
+
+
+class MouseTCN(nn.Module):
+    """Causal TCN mirroring the notebook architecture."""
+
+    def __init__(self, n_feat: int, n_class: int, channels: Tuple[int, ...] = (64, 64, 128, 128), k: int = 3, dropout: float = 0.1):
+        super().__init__()
+        blocks = []
+        in_c = n_feat
+        for i, out_c in enumerate(channels):
+            blocks.append(TemporalBlock(in_c, out_c, k=k, d=2**i, dropout=dropout))
+            in_c = out_c
+        self.tcn = nn.Sequential(*blocks)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(in_c, n_class)
+
+    def forward(self, x):
+        x = self.tcn(x)
+        x = self.pool(x).squeeze(-1)
         return self.fc(x)
 
 
 @dataclass
-class CNNConfig:
-    model_dir: Path = Path("models/1d-cnn")
+class TCNConfig:
+    model_dir: Path = Path("models/tcn")
     n_splits: int = 3
     window_size: int = 30
-    base_filters: int = 64
     patience: int = 5
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    train_batch_size: int = 256
-    val_batch_size: int = 512
-
-
-def tune_thresholds_per_class(y_true: np.ndarray, y_pred_prob: np.ndarray, class_names: list[str]) -> tuple[dict, dict]:
-    best_thrs = {}
-    best_f1s = {}
-    thresholds = np.linspace(0.01, 0.99, 99)
-    for idx, name in enumerate(class_names):
-        p = y_pred_prob[:, idx]
-        y_t = y_true[:, idx]
-        pred_matrix = p[:, None] >= thresholds[None, :]
-        tp = (pred_matrix & (y_t[:, None] == 1)).sum(axis=0)
-        fp = (pred_matrix & (y_t[:, None] == 0)).sum(axis=0)
-        fn = ((~pred_matrix) & (y_t[:, None] == 1)).sum(axis=0)
-        f1_scores = 2 * tp / (2 * tp + fp + fn + 1e-7)
-        best_idx = int(np.argmax(f1_scores))
-        best_f1s[name] = float(f1_scores[best_idx])
-        best_thrs[name] = float(thresholds[best_idx])
-    return best_thrs, best_f1s
-
-
-def save_feature_columns(ref_cols: list[str], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(ref_cols, f)
+    dropout: float = 0.1
 
 
 def _compute_video_labels(label_np: List[np.ndarray]) -> np.ndarray:
@@ -150,8 +119,8 @@ def _compute_video_labels(label_np: List[np.ndarray]) -> np.ndarray:
     return np.array(video_labels)
 
 
-def train_evaluate_cnn(feat_list: List[pd.DataFrame], label_list: List[pd.DataFrame], meta_list: List[pd.DataFrame], *, cfg: CNNConfig):
-    """CNN trainer aligned with notebook logic (StratifiedGroupKFold, focal BCE, threshold tuning)."""
+def train_evaluate_tcn(feat_list: List[pd.DataFrame], label_list: List[pd.DataFrame], *, cfg: TCNConfig):
+    """Train causal TCN with StratifiedGroupKFold; mirrors notebook logic."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg.model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -172,11 +141,12 @@ def train_evaluate_cnn(feat_list: List[pd.DataFrame], label_list: List[pd.DataFr
     label_np = [df.reindex(columns=ref_actions, fill_value=0).values.astype(np.float32) for df in label_list]
     video_indices = np.arange(len(feat_np))
     video_labels = _compute_video_labels(label_np)
+    video_groups = video_indices.copy()
 
     sgkf = StratifiedGroupKFold(n_splits=cfg.n_splits)
     fold_scores = []
 
-    for fold, (train_idx, val_idx) in enumerate(sgkf.split(video_indices, video_labels, video_indices)):
+    for fold, (train_idx, val_idx) in enumerate(sgkf.split(video_indices, video_labels, video_groups)):
         train_feats = [feat_np[i] for i in train_idx]
         val_feats = [feat_np[i] for i in val_idx]
         train_lbls = [label_np[i] for i in train_idx]
@@ -188,13 +158,15 @@ def train_evaluate_cnn(feat_list: List[pd.DataFrame], label_list: List[pd.DataFr
 
         ds_train = MABeLazyDataset(train_feats, scaler, train_lbls, window_size=cfg.window_size)
         ds_val = MABeLazyDataset(val_feats, scaler, val_lbls, window_size=cfg.window_size)
-        loader_train = DataLoader(ds_train, batch_size=cfg.train_batch_size, shuffle=True, num_workers=0)
-        loader_val = DataLoader(ds_val, batch_size=cfg.val_batch_size, shuffle=False, num_workers=0)
+        loader_train = DataLoader(ds_train, batch_size=256, shuffle=True, num_workers=0)
+        loader_val = DataLoader(ds_val, batch_size=512, shuffle=False, num_workers=0)
 
-        model = MouseResNet1D(n_feat=len(ref_cols), n_class=len(ref_actions), base_filters=cfg.base_filters).to(device)
+        n_feat = len(ref_cols)
+        n_class = len(ref_actions)
+        model = MouseTCN(n_feat=n_feat, n_class=n_class, dropout=cfg.dropout).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-        pos_counts = np.zeros(len(ref_actions))
+        pos_counts = np.zeros(n_class)
         total_samples = 0
         for arr in train_lbls:
             if len(arr) >= cfg.window_size:
@@ -207,7 +179,7 @@ def train_evaluate_cnn(feat_list: List[pd.DataFrame], label_list: List[pd.DataFr
 
         best_f1 = 0.0
         no_improve = 0
-        for _ in range(50):  # upper bound; early stop by patience
+        for epoch in range(50):
             model.train()
             for xb, yb in loader_train:
                 xb, yb = xb.to(device), yb.to(device)
